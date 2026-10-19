@@ -271,7 +271,7 @@ factories (`createTerminalNode`, `createSshTerminalNode`, `createAgentNode(agent
 group transforms (`groupSelectedNodes`, `ungroupNodes`, `duplicateNode`), and the
 `nodeStatesToFlow` / `flowToNodeStates` serializers. Node kinds (`NodeKind` in
 `src/shared/types.ts`): `terminal | sticky | group | editor | diff | video | web | browser |
-files | subagent | loop | dino | trigger` — `subagent` and `loop` are render-only (ephemeral hook-driven
+files | subagent | loop | dino | trigger | simulator | whiteboard` — `subagent` and `loop` are render-only (ephemeral hook-driven
 viz) and never persisted. `trigger` (issue #493, all four
 phases landed) is a first-class PERSISTED kind. The whole host-side
 machine is composed ONCE in `core/trigger-service.ts` (`startTriggerService`) and booted
@@ -2161,6 +2161,17 @@ number: change the table in that one module, never in one emulator.
     one file. Guard on both dialects, construct in one.
   - **Mobile**: N/A — *nodeterm mobile* attaches to tmux sessions over the transport protocol and
     has no canvas or file-browsing concept; adding one means extending that protocol.
+- **whiteboard** (`WhiteboardNode.tsx`, `whiteboard/WhiteboardEditor.tsx`) — an Excalidraw board;
+  full write-up in `docs/whiteboard-node.md`. The invariants: (1) editing is ONE live editor
+  portaled into `.canvas-root` over the node's box, never inside the scaled node (pointer drift,
+  blur, and `.flow-wrap`'s wheel capture); (2) the scene is a side file the core addresses by
+  (project, node id) — `core/whiteboards.ts` — and NEVER by a path from node data (project.json is
+  git-shared, hostile input); node data holds only `whiteboardSource` (a copy's original, by id)
+  and `boardRev` (once per session); (3) the overlay is `data-nt-keyboard-owner`, which every
+  typing-aware key site honours via `isKeyboardOwnerTarget`; (4) every save path compares versions
+  against disk, and the unmount flush writes a snapshot kept from `onChange` — Excalidraw's api is
+  empty by cleanup time, and reading it there once erased a board. Excalidraw loads lazily; fonts
+  come from `scripts/excalidraw-assets-plugin.ts`; mermaid is aliased to a stub.
 - **Run node** (a `terminal` node carrying `data.runConfig`, NOT a new NodeKind;
   `@shared/run-config`, `core/run-service.ts`, `nodes/RunBar.tsx`) — VS Code's "Run Without
   Debugging" for any `.vscode/launch.json` configuration. The toolbar picks a folder (defaults to
@@ -8781,8 +8792,13 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
   should gain the three categories. All three are the iOS follow-up, not desktop work.
 - **Omni Kanban (global swimlanes)** (`components/kanban/GlobalKanbanView.tsx`; one swimlane per open project; `state/viewMode.ts` `globalKanban` (localStorage `nodeterm.globalKanban`, machine-local, like `viewByProject`) + `settings.omniKanbanEnabled` (feature gate, default OFF, `settings.json`) / `omniKanbanAsDefault` (when true, `view.kanbanToggle` — Cmd+Shift+B — opens Omni; otherwise per-project; `view.globalKanbanToggle` registry command — unbound, remappable — always opens Omni when enabled); **Omni is a SCOPE of the kanban side, not a third view**: the view toggle (tab icon, ⌘⇧B, the menu) flips canvas ⇄ board, and a board header's `KanbanScopeSwitch` ("This project" / "All projects", rendered only while the feature is on) moves between the two scopes — so leaving Omni through the switch lands on the project's board, and the view toggle from Omni lands on the canvas (it used to fall through to whatever the project's view happened to be, so "Canvas view" from Omni could land on a board). The decisions live once in `state/viewMode.ts` (`toggleBoardView` / `toggleAllProjectsBoard` / `showProjectBoard` / `showCanvas`), called by TabBar, the menu IPC and both registry commands; Omni has no close button. `globalKanban` deliberately stays independent of the active project, so a project switch made from a lane does not drop the user out of Omni. `isGlobalKanbanOpen()` is the single gate (fail-closed, static import of `useSettings` — the earlier `require` failed open in the packaged renderer). Non-active lanes are derived from serialized `p.nodes` via `toKanbanSessionState` (the persisted-state counterpart to `toKanbanSession`); the ACTIVE project's lane is fed LIVE by Canvas (`GlobalKanbanLive`: the same `kanbanSessionsFrom(nodes)` cards + live `teamStations` the per-project board uses), because its edits reach the store only at the next ~800 ms autosave — a store-fed lane reverted the card modal's controlled sticky textarea on every keystroke and pruned the assignment of a card created a moment earlier. The open card modal is ONE overview-level fact reported to Canvas's `setKanbanModalNode` (watched for Eco, wake-on-open, dictation target), never per-lane state; each lane's board write resolves ITS project's session (`sessionForProject`) for the hosted read-only refusal and the board-log api; `pendingLaunch` never becomes `initialCommand` in the modal (the DAG launch must fire only when dependencies report done, and the canvas `TerminalNode` already delivers `initialCommand` via `writeWhenShellReady` after the `nodeterm:create-node` project switch). Active-project edits (rename / sticky / browser nav) route through Canvas live nodes (`setNodes` + `markDirty`), non-active through the store + `writeDisk`; delete uses `ConfirmDialog` (not `confirm`) and then `deleteNodes` (active project) or `closeStoredNodes` (any other) — the existing cross-project teardown funnel, never a hand-rolled copy. The top bar's project pills and Cmd/Ctrl+1..9 (`nodeterm:swimlane-jump`) jump to the lane; header hint shows the correct mod (`Cmd` on Mac, `Ctrl` elsewhere). Server Edition works as-is, Mobile N/A.
 - **Settings** (`SettingsPage.tsx`, ⚙ / ⌘,): font/cursor (live to xterm + Monaco), default
-  shell, grid + snap, **default node size** (`defaultNodeWidth`/`defaultNodeHeight` — new
-  terminal/agent nodes only, clamped in `terminalNodeSize()` in `state/workspace.ts`),
+  shell, grid + snap, **default node size** (one row with a kind picker: terminal/agent is the
+  `defaultNodeWidth`/`defaultNodeHeight` pair, clamped in `terminalNodeSize()`; every other kind
+  the add menus create is an optional entry in `defaultNodeSizes`, resolved by `defaultNodeSize(kind)`
+  in `state/workspace.ts` through `@shared/default-node-size`, which clamps hand edits to the kind's
+  `NODE_MIN_SIZES` and 2400×1600 — new factories must place through `placeSized`, not a literal
+  `*_SIZE`, or the setting silently stops applying to that kind; the agent `settings` verb exposes
+  only the terminal pair),
   pan-hover delay, double-click focus, accent, tmux on/scrollback, commit agent,
   `seenShortcuts`. **Every section is MOUNTED whenever Settings is open** — an inactive one
   returns null from `SettingsSection`, but its hooks and the whole render body above that return
